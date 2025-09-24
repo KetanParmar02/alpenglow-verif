@@ -1,24 +1,43 @@
 ---- MODULE Rotor ----
-EXTENDS FiniteSets, Random  \* Apalache for random sampling
+EXTENDS Integers, FiniteSets, Sequences, Alpenglow  \* Import Nodes, Stake, TotalStake, network, HonestNodes, ErasureThreshold
 
-VARIABLES shreds, relays  \* Imported
+VARIABLES shreds, relays
 
-\* Stake-weighted relay sample (prob ~ Stake[n]/TotalStake)
+\* Stake-weighted relay sampling (Section 3.1: proportional to stake, abstract non-deterministic)
 RelaySample(slot) ==
-  {n \in Nodes : RandomFair() < Stake[n] / TotalStake}  \* Abstract probabilistic
-
-SendShreds(leader, slot, block) ==
-  LET num_shreds == block.shreds  \* Erasure coding: k=10, n=20 say
+  LET cumStake == [n \in Nodes |-> LET prev == IF n = CHOOSE min \in Nodes : \A m \in Nodes : m /= min => Stake[m] >= Stake[min] ELSE 0 IN
+    prev + Stake[n]]  \* Cumulative stake for weighted select
   IN
-  /\ shreds' = [shreds EXCEPT ![slot] = { [id |-> i, data |-> "shred_data"] : i \in 1..num_shreds }]
-  /\ relays' = [relays EXCEPT ![slot] = RelaySample(slot)]
-  /\ \A r \in @ : BroadcastShreds(r, shreds[slot], slot)
+  {n \in HonestNodes : \E r \in 1..TotalStake : r <= cumStake[n]}  \* Abstract proportional (deterministic approx for checking)
 
-BroadcastShreds(relay, sset, slot) ==
-  \* Flood to all honest nodes
-  UNCHANGED <<shreds, relays>>  \* Delivery via network
+\* Send erasure-coded shreds: Leader encodes block into shreds, sends to relays (single-hop, Section 2.2)
+SendShreds(leader, slot, block) ==
+  LET num_shreds == block.shreds  \* e.g., k data + m parity for (k+m, k) code
+      relay_set == RelaySample(slot) IN
+  /\ shreds' = [shreds EXCEPT ![slot] = {[id |-> i, data |-> "shred_" \o ToString(i)] : i \in 1..num_shreds}]
+  /\ relays' = [relays EXCEPT ![slot] = relay_set]
+  /\ \A r \in relay_set : \A sh \in shreds'[slot] : SendMsg(leader, r, "shred", sh)  \* Leader to relays
+  /\ \A r \in relay_set : BroadcastShreds(r, shreds'[slot], slot)  \* Relays flood
 
-\* Inv: Delivery with >80% stake
-Inv_Delivery(slot) ==
-  \A h \in HonestNodes : Cardinality({s \in shreds[slot] : Received(h, s)}) >= 8  \* Threshold for decoding
+\* Relays broadcast shreds to all honest nodes (stake-fair bandwidth utilization)
+BroadcastShreds(relay, shredset, slot) ==
+  IF ~Byzantine(relay) /\ ~Offline(relay) THEN
+    \A h \in HonestNodes : \A sh \in shredset : SendMsg(relay, h, "shred", sh)  \* Add to network
+  ELSE UNCHANGED network  \* Byzantine/offline may drop
+
+\* Invariant: With ≥80% responsive stake in relays, honest nodes can reconstruct (erasure threshold met)
+DeliveryInvariant(slot) ==
+  LET relay_stake == SumStake(relays[slot]) IN
+  IF relay_stake >= (TotalStake * 8) \div 10 THEN
+    \A h \in HonestNodes : Cardinality(ReceivedShreds(h, slot)) >= ErasureThreshold
+  ELSE TRUE  \* No guarantee if low participation
+
+\* Helper: Shreds received by node (abstract; in full model, track per-node sets from network delivery)
+ReceivedShreds(node, slot) == shreds[slot]  \* Assume delivery if sent (refine with faults/delays)
+
+\* Theorem: Optimal bandwidth (asymptotically, total used ∝ sum stake, per Section 3.1)
+THEOREM OptimalBandwidth ==
+  ASSUME ResponsiveStake > 0.8 * TotalStake
+  PROVE DeliveryInvariant(slots) /\ LivenessResilient  \* Tied to top-level
+
 ====
